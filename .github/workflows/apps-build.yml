@@ -4,145 +4,186 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Build tag"
         required: true
         type: string
-
       release_tag:
-        description: "Release tag containing the Flutter ZIP"
         required: true
         type: string
-
       build_type:
-        description: "APK build type"
         required: true
         type: choice
         options:
           - debug
           - release
-        default: release
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
-    name: Build Flutter APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
-      - name: Show build information
-        run: |
-          echo "Build tag: ${{ inputs.tag }}"
-          echo "Release tag: ${{ inputs.release_tag }}"
-          echo "Build type: ${{ inputs.build_type }}"
-
-      - name: Download ZIP from release
+      - name: Download project ZIP from Release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
 
-          mkdir -p source
+          mkdir -p /tmp/project/src
+
+          release_json=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")
+
+          asset_url=$(echo "$release_json" | python3 -c '
+          import json,sys
+          d=json.load(sys.stdin)
+          a=[x for x in d.get("assets",[]) if x["name"].lower().endswith(".zip")]
+          print(a[0]["url"] if a else "")
+          ')
+
+          test -n "$asset_url"
 
           curl -fsSL \
             -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ inputs.release_tag }}" \
-            > release.json
-
-          ASSET_URL="$(jq -r '.assets[] | select(.name | endswith(".zip")) | .url' release.json | head -n 1)"
-
-          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
-            echo "ERROR: Tidak ada asset ZIP pada release."
-            exit 1
-          fi
-
-          curl -fL \
-            -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/octet-stream" \
-            "$ASSET_URL" \
-            -o source/project.zip
+            "$asset_url" \
+            -o /tmp/project/project.zip
 
-      - name: Extract project
+          unzip -q /tmp/project/project.zip -d /tmp/project/src
+
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Locate Flutter project
         run: |
           set -euo pipefail
 
-          mkdir -p project
+          if [ -f /tmp/project/src/pubspec.yaml ]; then
+            echo "PROJECT_DIR=/tmp/project/src" >> "$GITHUB_ENV"
+          else
+            p=$(find /tmp/project/src \
+              -name pubspec.yaml \
+              -type f \
+              -print -quit | xargs -r dirname)
 
-          unzip -q source/project.zip -d project
+            test -n "$p"
 
-          PUBSPEC="$(find project -type f -name pubspec.yaml -print -quit)"
-
-          if [ -z "$PUBSPEC" ]; then
-            echo "ERROR: pubspec.yaml tidak ditemukan."
-            exit 1
+            echo "PROJECT_DIR=$p" >> "$GITHUB_ENV"
           fi
 
-          echo "Flutter project ditemukan:"
-          echo "$(dirname "$PUBSPEC")"
-
-          echo "PROJECT_DIR=$(dirname "$PUBSPEC")" >> "$GITHUB_ENV"
-
-      - name: Setup Java 17
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      - name: Flutter doctor
+      - name: Prepare Android Gradle compatibility
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
         run: |
-          flutter doctor -v
+          set -euo pipefail
 
-      - name: Flutter pub get
+          # Flutter current Android toolchain requires Gradle >= 8.14.
+          if [ -f android/gradle/wrapper/gradle-wrapper.properties ]; then
+            python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path(
+              "android/gradle/wrapper/gradle-wrapper.properties"
+          )
+
+          s = p.read_text()
+
+          s = re.sub(
+              r'distributionUrl=.*',
+              'distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14-bin.zip',
+              s
+          )
+
+          p.write_text(s)
+          PY
+          fi
+
+          # Compatibility flags for projects using newer AGP.
+          mkdir -p android
+          touch android/gradle.properties
+
+          grep -q '^android.newDsl=' \
+            android/gradle.properties \
+            || echo 'android.newDsl=false' \
+              >> android/gradle.properties
+
+          grep -q '^android.builtInKotlin=' \
+            android/gradle.properties \
+            || echo 'android.builtInKotlin=false' \
+              >> android/gradle.properties
+
+          echo "--- Gradle wrapper ---"
+
+          grep 'distributionUrl' \
+            android/gradle/wrapper/gradle-wrapper.properties \
+            || true
+
+          echo "--- Android compatibility flags ---"
+
+          grep '^android\.' \
+            android/gradle.properties \
+            || true
+
+      - name: Install dependencies
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           flutter pub get
 
-      - name: Build debug
-        if: ${{ inputs.build_type == 'debug' }}
+      - name: Clean
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          flutter build apk --debug
+          flutter clean
 
-      - name: Build release
-        if: ${{ inputs.build_type == 'release' }}
+      - name: Build APK
         working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          flutter build apk --release
-
-      - name: Collect APK
         run: |
           set -euo pipefail
 
-          mkdir -p output
-
-          APK="$(find "${PROJECT_DIR}/build/app/outputs/flutter-apk" \
-            -type f \
-            -name "*.apk" \
-            -print -quit)"
-
-          if [ -z "$APK" ]; then
-            echo "ERROR: APK tidak ditemukan."
-            exit 1
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            flutter build apk --debug
+          else
+            flutter build apk --release
           fi
 
-          cp "$APK" \
-            "output/LI_BING_BING_BUILD_${{ inputs.build_type }}.apk"
+      - name: Verify APK output
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
 
-          ls -lh output/
+          find build/app/outputs/flutter-apk \
+            -maxdepth 1 \
+            -type f \
+            -name '*.apk' \
+            -print
+
+          test -n "$(find \
+            build/app/outputs/flutter-apk \
+            -maxdepth 1 \
+            -type f \
+            -name '*.apk' \
+            -print -quit)"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LI_BING_BING_BUILD_${{ inputs.build_type }}
-          path: output/*.apk
+          name: flutter-apk-${{ inputs.build_type }}
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/*.apk
           if-no-files-found: error
           retention-days: 7

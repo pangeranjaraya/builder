@@ -4,12 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       tag:
+        description: "Build tag"
         required: true
         type: string
+
       release_tag:
+        description: "GitHub Release tag containing the Flutter ZIP"
         required: true
         type: string
+
       build_type:
+        description: "APK build type"
         required: true
         type: choice
         options:
@@ -17,170 +22,238 @@ on:
           - release
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
+    name: Build Flutter APK
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
     steps:
-      - name: Download project ZIP from Release
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Flutter ZIP from Release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.release_tag }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p /tmp/project/src
+          mkdir -p "$RUNNER_TEMP/flutter_project"
 
-          release_json=$(curl -fsSL \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")
-
-          asset_url=$(echo "$release_json" | python3 -c '
-          import json,sys
-          d=json.load(sys.stdin)
-          a=[x for x in d.get("assets",[]) if x["name"].lower().endswith(".zip")]
-          print(a[0]["url"] if a else "")
-          ')
-
-          test -n "$asset_url"
+          RELEASE_API="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}"
 
           curl -fsSL \
-            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "$RELEASE_API" \
+            -o "$RUNNER_TEMP/release.json"
+
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          path = os.path.join(
+              os.environ["RUNNER_TEMP"],
+              "release.json"
+          )
+
+          with open(path, "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          assets = data.get("assets", [])
+
+          zip_assets = [
+              a for a in assets
+              if a.get("name", "").lower().endswith(".zip")
+          ]
+
+          if not zip_assets:
+              print("ERROR: Tidak ditemukan ZIP di GitHub Release.")
+              sys.exit(1)
+
+          asset = zip_assets[0]
+
+          print("ZIP asset:", asset["name"])
+          print("Asset URL:", asset["url"])
+
+          with open(
+              os.path.join(
+                  os.environ["RUNNER_TEMP"],
+                  "asset_url.txt"
+              ),
+              "w",
+              encoding="utf-8"
+          ) as f:
+              f.write(asset["url"])
+          PY
+
+          ASSET_URL="$(cat "$RUNNER_TEMP/asset_url.txt")"
+
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/octet-stream" \
-            "$asset_url" \
-            -o /tmp/project/project.zip
+            "$ASSET_URL" \
+            -o "$RUNNER_TEMP/project.zip"
 
-          unzip -q /tmp/project/project.zip -d /tmp/project/src
-
-      - uses: actions/checkout@v4
-        with:
-          path: repo
+          unzip -q \
+            "$RUNNER_TEMP/project.zip" \
+            -d "$RUNNER_TEMP/flutter_project"
 
       - name: Locate Flutter project
+        shell: bash
         run: |
           set -euo pipefail
 
-          if [ -f /tmp/project/src/pubspec.yaml ]; then
-            echo "PROJECT_DIR=/tmp/project/src" >> "$GITHUB_ENV"
+          PROJECT_DIR=""
+
+          if [ -f "$RUNNER_TEMP/flutter_project/pubspec.yaml" ]; then
+            PROJECT_DIR="$RUNNER_TEMP/flutter_project"
           else
-            p=$(find /tmp/project/src \
-              -name pubspec.yaml \
-              -type f \
-              -print -quit | xargs -r dirname)
-
-            test -n "$p"
-
-            echo "PROJECT_DIR=$p" >> "$GITHUB_ENV"
+            PROJECT_DIR="$(
+              find "$RUNNER_TEMP/flutter_project" \
+                -name pubspec.yaml \
+                -type f \
+                -print -quit \
+                | xargs -r dirname
+            )"
           fi
 
-      - uses: actions/setup-java@v4
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: pubspec.yaml tidak ditemukan."
+            find "$RUNNER_TEMP/flutter_project" -maxdepth 4 -type f | head -200
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "Flutter project:"
+          echo "$PROJECT_DIR"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
-      - uses: subosito/flutter-action@v2
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      - name: Prepare Android Gradle compatibility
+      - name: Prepare Android toolchain
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set -euo pipefail
 
-          # Flutter current Android toolchain requires Gradle >= 8.14.
-          if [ -f android/gradle/wrapper/gradle-wrapper.properties ]; then
-            python3 - <<'PY'
+          mkdir -p android/gradle/wrapper
+
+          WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
+
+          if [ -f "$WRAPPER" ]; then
+            python3 - "$WRAPPER" <<'PY'
+          import sys
           from pathlib import Path
-          import re
 
-          p = Path(
-              "android/gradle/wrapper/gradle-wrapper.properties"
-          )
+          path = Path(sys.argv[1])
+          text = path.read_text()
 
-          s = p.read_text()
+          lines = []
 
-          s = re.sub(
-              r'distributionUrl=.*',
-              'distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14-bin.zip',
-              s
-          )
+          for line in text.splitlines():
+              if line.startswith("distributionUrl="):
+                  line = (
+                      "distributionUrl="
+                      "https\\://services.gradle.org/distributions/"
+                      "gradle-8.14-bin.zip"
+                  )
+              lines.append(line)
 
-          p.write_text(s)
+          path.write_text("\n".join(lines) + "\n")
           PY
+          else
+            cat > "$WRAPPER" <<'EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.14-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
           fi
 
-          # Compatibility flags for projects using newer AGP.
-          mkdir -p android
           touch android/gradle.properties
 
-          grep -q '^android.newDsl=' \
-            android/gradle.properties \
-            || echo 'android.newDsl=false' \
-              >> android/gradle.properties
+          if ! grep -q '^org.gradle.jvmargs=' android/gradle.properties; then
+            echo 'org.gradle.jvmargs=-Xmx4G -Dfile.encoding=UTF-8' >> android/gradle.properties
+          fi
 
-          grep -q '^android.builtInKotlin=' \
-            android/gradle.properties \
-            || echo 'android.builtInKotlin=false' \
-              >> android/gradle.properties
+          echo "Gradle:"
+          grep 'distributionUrl' "$WRAPPER"
 
-          echo "--- Gradle wrapper ---"
-
-          grep 'distributionUrl' \
-            android/gradle/wrapper/gradle-wrapper.properties \
-            || true
-
-          echo "--- Android compatibility flags ---"
-
-          grep '^android\.' \
-            android/gradle.properties \
-            || true
-
-      - name: Install dependencies
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          flutter pub get
-
-      - name: Clean
+      - name: Flutter clean
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           flutter clean
 
-      - name: Build APK
+      - name: Flutter pub get
         working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter pub get
+
+      - name: Show Flutter diagnostics
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter --version
+          flutter doctor -v || true
+
+      - name: Build Debug APK
+        if: ${{ inputs.build_type == 'debug' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter build apk --debug
+
+      - name: Build Release APK
+        if: ${{ inputs.build_type == 'release' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter build apk --release
+
+      - name: Verify APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          if [ "${{ inputs.build_type }}" = "debug" ]; then
-            flutter build apk --debug
-          else
-            flutter build apk --release
-          fi
+          APK_DIR="build/app/outputs/flutter-apk"
 
-      - name: Verify APK output
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          set -euo pipefail
-
-          find build/app/outputs/flutter-apk \
+          echo "APK files:"
+          find "$APK_DIR" \
             -maxdepth 1 \
             -type f \
-            -name '*.apk' \
+            -name "*.apk" \
             -print
 
-          test -n "$(find \
-            build/app/outputs/flutter-apk \
+          APK="$(find "$APK_DIR" \
             -maxdepth 1 \
             -type f \
-            -name '*.apk' \
+            -name "*.apk" \
             -print -quit)"
 
-      - name: Upload APK artifact
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK tidak ditemukan."
+            exit 1
+          fi
+
+          echo "APK berhasil:"
+          ls -lh "$APK"
+
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: flutter-apk-${{ inputs.build_type }}

@@ -1,0 +1,378 @@
+name: Web to APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Website URL (must start with http:// or https://)"
+        required: true
+        type: string
+      app_name:
+        description: "Application Name"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Web APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Validate Input
+        env:
+          WEBSITE_URL: ${{ inputs.url }}
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          set -e
+
+          echo "Website: $WEBSITE_URL"
+          echo "App:     $APP_NAME"
+
+          if [[ ! "$WEBSITE_URL" =~ ^https?:// ]]; then
+            echo "ERROR: URL harus diawali http:// atau https://"
+            exit 1
+          fi
+
+          if [[ -z "${APP_NAME// }" ]]; then
+            echo "ERROR: Application Name tidak boleh kosong"
+            exit 1
+          fi
+
+      - name: Create Flutter Project
+        run: |
+          set -e
+          rm -rf web_to_apk
+          flutter create \
+            --org com.webtoapk \
+            --project-name web_to_apk \
+            web_to_apk
+
+      - name: Configure Flutter Project
+        working-directory: web_to_apk
+        run: |
+          set -e
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          pubspec = """name: web_to_apk
+          description: Web to APK application
+          publish_to: "none"
+
+          environment:
+            sdk: ">=3.0.0 <4.0.0"
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            webview_flutter: ^4.10.0
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+            flutter_lints: ^5.0.0
+
+          flutter:
+            uses-material-design: true
+          """
+
+          lines = [
+              line[10:] if line.startswith(" " * 10) else line
+              for line in pubspec.splitlines()
+          ]
+          Path("pubspec.yaml").write_text("\n".join(lines) + "\n")
+          print("pubspec.yaml written")
+          PY
+
+      - name: Configure Android Manifest
+        working-directory: web_to_apk
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          set -e
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          app_name = os.environ.get("APP_NAME", "Web App")
+
+          path = Path("android/app/src/main/AndroidManifest.xml")
+          text = path.read_text()
+
+          # 1) Add INTERNET permission right after the opening <manifest ...> tag
+          if "android.permission.INTERNET" not in text:
+              text = re.sub(
+                  r'(<manifest\b[^>]*>)',
+                  r'\1\n    <uses-permission android:name="android.permission.INTERNET" />',
+                  text,
+                  count=1,
+              )
+
+          # 2) Rewrite android:label on <application ...>
+          def replace_label(match):
+              attrs = match.group(1)
+              safe = app_name.replace('"', '\\"')
+              if "android:label=" in attrs:
+                  attrs = re.sub(
+                      r'android:label="[^"]*"',
+                      'android:label="{}"'.format(safe),
+                      attrs,
+                      count=1,
+                  )
+              else:
+                  attrs = 'android:label="{}" '.format(safe) + attrs
+              return "<application " + attrs + ">"
+
+          text = re.sub(r'<application\b([^>]*)>', replace_label, text, count=1)
+
+          path.write_text(text)
+          print("AndroidManifest.xml updated")
+          PY
+
+      - name: Create WebView Application
+        working-directory: web_to_apk
+        run: |
+          set -e
+          mkdir -p lib
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          dart = r'''import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          const String websiteUrl = String.fromEnvironment(
+            'WEBSITE_URL',
+            defaultValue: 'https://example.com',
+          );
+
+          const String appName = String.fromEnvironment(
+            'APP_NAME',
+            defaultValue: 'Web App',
+          );
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(const WebToApk());
+          }
+
+          class WebToApk extends StatelessWidget {
+            const WebToApk({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                debugShowCheckedModeBanner: false,
+                title: appName,
+                home: const WebHome(),
+              );
+            }
+          }
+
+          class WebHome extends StatefulWidget {
+            const WebHome({super.key});
+
+            @override
+            State<WebHome> createState() => _WebHomeState();
+          }
+
+          class _WebHomeState extends State<WebHome> {
+            late final WebViewController controller;
+
+            bool loading = true;
+
+            @override
+            void initState() {
+              super.initState();
+
+              controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setNavigationDelegate(
+                  NavigationDelegate(
+                    onPageStarted: (url) {
+                      if (mounted) {
+                        setState(() {
+                          loading = true;
+                        });
+                      }
+                    },
+                    onPageFinished: (url) {
+                      if (mounted) {
+                        setState(() {
+                          loading = false;
+                        });
+                      }
+                    },
+                    onWebResourceError: (error) {
+                      if (mounted) {
+                        setState(() {
+                          loading = false;
+                        });
+                      }
+                    },
+                  ),
+                )
+                ..loadRequest(Uri.parse(websiteUrl));
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                body: SafeArea(
+                  child: Stack(
+                    children: [
+                      WebViewWidget(controller: controller),
+                      if (loading)
+                        const Align(
+                          alignment: Alignment.topCenter,
+                          child: LinearProgressIndicator(),
+                        ),
+                    ],
+                  ),
+                ),
+              );
+            }
+          }
+          '''
+
+          lines = [
+              line[10:] if line.startswith(" " * 10) else line
+              for line in dart.splitlines()
+          ]
+          Path("lib/main.dart").write_text("\n".join(lines) + "\n")
+          print("lib/main.dart written")
+          PY
+
+      - name: Install Dependencies
+        working-directory: web_to_apk
+        run: |
+          set -e
+          flutter clean
+          flutter pub get
+
+      - name: Analyze (non-blocking)
+        working-directory: web_to_apk
+        continue-on-error: true
+        run: |
+          flutter analyze 2>&1 | tee ../flutter-analyze.log
+
+      - name: Build APK
+        working-directory: web_to_apk
+        env:
+          WEBSITE_URL: ${{ inputs.url }}
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          set +e
+          flutter build apk \
+            --release \
+            --dart-define=WEBSITE_URL="$WEBSITE_URL" \
+            --dart-define=APP_NAME="$APP_NAME" \
+            2>&1 | tee ../flutter-build.log
+          EXIT_CODE=${PIPESTATUS[0]}
+          exit $EXIT_CODE
+
+      - name: Find APK
+        if: success()
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          set -e
+          mkdir -p output
+
+          APK=$(find web_to_apk/build/app/outputs/flutter-apk -type f -name "*.apk" | head -n 1)
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK tidak ditemukan"
+            exit 1
+          fi
+
+          SAFE_NAME=$(printf '%s' "$APP_NAME" | tr ' ' '_' | tr -cd '[:alnum:]_.-')
+
+          if [ -z "$SAFE_NAME" ]; then
+            SAFE_NAME="web_app"
+          fi
+
+          cp "$APK" "output/${SAFE_NAME}.apk"
+
+          echo "APK:"
+          ls -lh output
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-to-apk
+          path: output/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Build Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-to-apk-logs
+          path: |
+            flutter-analyze.log
+            flutter-build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Show Error Logs
+        if: failure()
+        run: |
+          echo "========================================"
+          echo "WEB TO APK BUILD FAILED"
+          echo "========================================"
+
+          if [ -f flutter-analyze.log ]; then
+            echo ""
+            echo "===== ANALYZE ====="
+            tail -n 200 flutter-analyze.log
+          fi
+
+          if [ -f flutter-build.log ]; then
+            echo ""
+            echo "===== BUILD ====="
+            tail -n 300 flutter-build.log
+          fi
+
+          echo ""
+          echo "===== FLUTTER ====="
+          flutter --version
+
+          echo ""
+          echo "===== JAVA ====="
+          java -version
+
+          echo "========================================"
